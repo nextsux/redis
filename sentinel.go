@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"math/rand"
 	"net"
 	"strings"
 	"sync"
@@ -48,6 +49,9 @@ type FailoverOptions struct {
 	IdleCheckFrequency time.Duration
 
 	TLSConfig *tls.Config
+
+	// Enables read-only commands on slave nodes.
+	ReadOnly bool
 }
 
 func (opt *FailoverOptions) options() *Options {
@@ -75,6 +79,8 @@ func (opt *FailoverOptions) options() *Options {
 		MaxConnAge:         opt.MaxConnAge,
 
 		TLSConfig: opt.TLSConfig,
+
+		sentinelReadOnly: opt.ReadOnly,
 	}
 }
 
@@ -328,7 +334,15 @@ func (c *sentinelFailover) Pool() *pool.ConnPool {
 }
 
 func (c *sentinelFailover) dial(ctx context.Context, network, _ string) (net.Conn, error) {
-	addr, err := c.MasterAddr()
+	var addr string
+	var err error
+
+	if c.opt.sentinelReadOnly {
+		addr, err = c.RandomSlaveAddr()
+	} else {
+		addr, err = c.MasterAddr()
+	}
+
 	if err != nil {
 		return nil, err
 	}
@@ -345,6 +359,17 @@ func (c *sentinelFailover) MasterAddr() (string, error) {
 	}
 	c.switchMaster(addr)
 	return addr, nil
+}
+
+func (c *sentinelFailover) RandomSlaveAddr() (string, error) {
+	addresses, err := c.slaveAddresses()
+	if err != nil {
+		return "", err
+	}
+	if len(addresses) < 1 {
+		return c.MasterAddr()
+	}
+	return addresses[rand.Intn(len(addresses))], nil
 }
 
 func (c *sentinelFailover) masterAddr() (string, error) {
@@ -410,6 +435,69 @@ func (c *sentinelFailover) masterAddr() (string, error) {
 	return "", errors.New("redis: all sentinels are unreachable")
 }
 
+func (c *sentinelFailover) slaveAddresses() ([]string, error) {
+	c.mu.RLock()
+	sentinel := c.sentinel
+	c.mu.RUnlock()
+
+	if sentinel != nil {
+		addrs := c.getSlaveAddrs(sentinel)
+		if len(addrs) > 0 {
+			return addrs, nil
+		}
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.sentinel != nil {
+		addrs := c.getSlaveAddrs(c.sentinel)
+		if len(addrs) > 0 {
+			return addrs, nil
+		}
+		_ = c.closeSentinel()
+	}
+
+	for i, sentinelAddr := range c.sentinelAddrs {
+		sentinel := NewSentinelClient(&Options{
+			Addr:   sentinelAddr,
+			Dialer: c.opt.Dialer,
+
+			Password: c.password,
+
+			MaxRetries: c.opt.MaxRetries,
+
+			DialTimeout:  c.opt.DialTimeout,
+			ReadTimeout:  c.opt.ReadTimeout,
+			WriteTimeout: c.opt.WriteTimeout,
+
+			PoolSize:           c.opt.PoolSize,
+			PoolTimeout:        c.opt.PoolTimeout,
+			IdleTimeout:        c.opt.IdleTimeout,
+			IdleCheckFrequency: c.opt.IdleCheckFrequency,
+
+			TLSConfig: c.opt.TLSConfig,
+		})
+
+		slaves, err := sentinel.Slaves(c.masterName).Result()
+		if err != nil {
+			internal.Logger.Printf("sentinel: Slaves master=%q failed: %s",
+				c.masterName, err)
+			_ = sentinel.Close()
+			continue
+		}
+
+		// Push working sentinel to the top.
+		c.sentinelAddrs[0], c.sentinelAddrs[i] = c.sentinelAddrs[i], c.sentinelAddrs[0]
+		c.setSentinel(sentinel)
+
+		addrs := parseSlaveAddresses(slaves)
+		return addrs, nil
+	}
+
+	return []string{}, errors.New("redis: all sentinels are unreachable")
+}
+
 func (c *sentinelFailover) getMasterAddr(sentinel *SentinelClient) string {
 	addr, err := sentinel.GetMasterAddrByName(c.masterName).Result()
 	if err != nil {
@@ -418,6 +506,40 @@ func (c *sentinelFailover) getMasterAddr(sentinel *SentinelClient) string {
 		return ""
 	}
 	return net.JoinHostPort(addr[0], addr[1])
+}
+
+func (c *sentinelFailover) getSlaveAddrs(sentinel *SentinelClient) []string {
+	addrs, err := sentinel.Slaves(c.masterName).Result()
+	if err != nil {
+		internal.Logger.Printf("sentinel: Slaves name=%q failed: %s",
+			c.masterName, err)
+		return []string{}
+	}
+
+	return parseSlaveAddresses(addrs)
+}
+
+func parseSlaveAddresses(addrs []interface{}) []string {
+	var nodes []string
+
+	for _, node := range addrs {
+		ip := ""
+		port := ""
+		lastkey := ""
+
+		for _, key := range node.([]interface{}) {
+			switch lastkey {
+			case "ip":
+				ip = key.(string)
+			case "port":
+				port = key.(string)
+			}
+			lastkey = key.(string)
+		}
+		nodes = append(nodes, net.JoinHostPort(ip, port))
+	}
+
+	return nodes
 }
 
 func (c *sentinelFailover) switchMaster(addr string) {
