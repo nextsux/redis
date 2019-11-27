@@ -520,7 +520,7 @@ func (c *sentinelFailover) getSlaveAddrs(sentinel *SentinelClient) []string {
 }
 
 func parseSlaveAddresses(addrs []interface{}) []string {
-	var nodes []string
+	nodes := []string{}
 
 	for _, node := range addrs {
 		ip := ""
