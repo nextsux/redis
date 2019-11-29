@@ -525,7 +525,9 @@ func parseSlaveAddresses(addrs []interface{}) []string {
 	for _, node := range addrs {
 		ip := ""
 		port := ""
+		flags := []string{}
 		lastkey := ""
+		is_down := false
 
 		for _, key := range node.([]interface{}) {
 			switch lastkey {
@@ -533,10 +535,21 @@ func parseSlaveAddresses(addrs []interface{}) []string {
 				ip = key.(string)
 			case "port":
 				port = key.(string)
+			case "flags":
+				flags = strings.Split(key.(string), ",")
 			}
 			lastkey = key.(string)
 		}
-		nodes = append(nodes, net.JoinHostPort(ip, port))
+		for _, flag := range flags {
+			switch flag {
+			case "s_down", "o_down", "disconnected":
+				is_down = true
+				break
+			}
+		}
+		if !is_down {
+			nodes = append(nodes, net.JoinHostPort(ip, port))
+		}
 	}
 
 	return nodes
